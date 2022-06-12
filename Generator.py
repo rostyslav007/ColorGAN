@@ -1,112 +1,73 @@
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
 
 
-class UnetBlockDown(nn.Module):
-    def __init__(self, in_channels, out_channels, activation=None):
-        super(UnetBlockDown, self).__init__()
-        self.max_pool = nn.MaxPool2d(kernel_size=2, stride=2)
-        self.conv1 = nn.Conv2d(in_channels, out_channels, kernel_size=3, bias=False, padding=1, padding_mode='reflect')
-        self.conv2 = nn.Conv2d(out_channels, out_channels, kernel_size=3, bias=False, padding=1, padding_mode='reflect')
-        self.batch_norm_1 = nn.InstanceNorm2d(out_channels)
-        self.batch_norm_2 = nn.InstanceNorm2d(out_channels)
-
-        self.activation = activation
-        if activation is None:
-            self.activation = nn.LeakyReLU(0.2)
-
-        # initialize parameters
-        for module in self.modules():
-            if isinstance(module, nn.Conv2d):
-                nn.init.normal_(module.weight, 0.0, 0.02)
+class Block(nn.Module):
+    def __init__(self, in_channels, out_channels, down=True, act='relu', use_dropout=False):
+        super(Block, self).__init__()
+        self.conv = nn.Sequential(
+            nn.Conv2d(in_channels, out_channels, kernel_size=4, stride=2, padding=1, bias=False, padding_mode='reflect')
+            if down
+            else nn.ConvTranspose2d(in_channels, out_channels, 4, 2, 1, bias=False),
+            nn.InstanceNorm2d(out_channels),
+            nn.ReLU() if act == 'relu' else nn.LeakyReLU(0.2)
+        )
+        self.use_dropout = use_dropout
+        self.use_dropout = nn.Dropout(0.5)
 
     def forward(self, x):
-        x = self.activation(self.batch_norm_1(self.conv1(x)))
-        x = self.activation(self.batch_norm_2(self.conv2(x)))
-        skip = x
-        x = self.max_pool(x)
-        return x, skip
-
-
-class UnetBlockUp(nn.Module):
-    def __init__(self, in_channels, out_channels, activation=None, up=True):
-        super(UnetBlockUp, self).__init__()
-        self.conv1 = nn.Conv2d(in_channels, out_channels, bias=False, kernel_size=3, padding=1, padding_mode='reflect')
-        self.conv2 = nn.Conv2d(out_channels, out_channels, bias=False, kernel_size=3, padding=1, padding_mode='reflect')
-        self.batch_norm_1 = nn.InstanceNorm2d(out_channels)
-        self.batch_norm_2 = nn.InstanceNorm2d(out_channels)
-
-        self.up = up
-        if up:
-            self.up_conv = nn.ConvTranspose2d(out_channels, out_channels // 2, bias=False, kernel_size=2, stride=2)
-        self.activation = activation
-        if activation is None:
-            self.activation = nn.LeakyReLU(0.2)
-
-        for module in self.modules():
-            if isinstance(module, nn.Conv2d) or isinstance(module, nn.ConvTranspose2d):
-                nn.init.normal_(module.weight, 0.0, 0.02)
-
-    def forward(self, x, skip):
-        x = torch.cat([skip, x], dim=1)
-        x = self.activation(self.batch_norm_1(self.conv1(x)))
-        x = self.activation(self.batch_norm_2(self.conv2(x)))
-
-        if self.up:
-            x = self.up_conv(x)
-
-        return x
+        x = self.conv(x)
+        return self.use_dropout(x) if self.use_dropout else x
 
 
 class Generator(nn.Module):
-    def __init__(self, in_list, out_list, img_size=None, num_channels=2):
-        super(Generator, self).__init__()
-
-        self.img_size = img_size
-        down_pairs = [(in_list[i-1], in_list[i]) for i in range(1, len(in_list))]
-        up_pairs = [(out_list[i-1], out_list[i]) for i in range(1, len(out_list))]
-
-        self.down_blocks = nn.ModuleList()
-        for in_c, out_c in down_pairs:
-            self.down_blocks.append(UnetBlockDown(in_c, out_c))
-
-        self.middle_part = nn.Sequential(
-            nn.Conv2d(in_list[-1], in_list[-1]*2, bias=False, kernel_size=3, padding=1, padding_mode='reflect'),
-            nn.InstanceNorm2d(in_list[-1] * 2),
-            nn.LeakyReLU(0.2),
-            nn.Conv2d(in_list[-1]*2, in_list[-1], bias=False, kernel_size=3, padding=1, padding_mode='reflect'),
-            nn.InstanceNorm2d(in_list[-1]),
-            nn.LeakyReLU(0.2),
-            nn.ConvTranspose2d(in_list[-1], in_list[-1], bias=False, kernel_size=2, stride=2),
+    def __init__(self, in_channels=1, out_channels=2, features=64):
+        super().__init__()
+        self.initial_down = nn.Sequential(
+            nn.Conv2d(in_channels, features, 4, 2, 1, padding_mode='reflect'),
             nn.LeakyReLU(0.2)
         )
-        for m in self.middle_part.modules():
-            if isinstance(m, nn.Conv2d) or isinstance(m, nn.ConvTranspose2d):
-                nn.init.normal_(m.weight, 0, 0.02)
 
-        self.up_blocks = nn.ModuleList()
-        for in_c, out_c in up_pairs[:-1]:
-            self.up_blocks.append(UnetBlockUp(in_c, out_c))
-        self.up_blocks.append((UnetBlockUp(*up_pairs[-1], up=False)))
+        self.down1 = Block(features, features*2, down=True, act='leaky', use_dropout=False) #64
+        self.down2 = Block(features*2, features*4, down=True, act='leaky', use_dropout=False) #32
+        self.down3 = Block(features*4, features*8, down=True, act='leaky', use_dropout=False) #16
+        self.down4 = Block(features*8, features*8, down=True, act='leaky', use_dropout=False) #8
+        self.down5 = Block(features*8, features*8, down=True, act='leaky', use_dropout=False) #4
+        self.down6 = Block(features*8, features*8, down=True, act='leaky', use_dropout=False) #2
+        self.bottleneck = nn.Sequential(
+            nn.Conv2d(features*8, features*8, 4, 2, 1, padding_mode='reflect'), #1x1
+            nn.LeakyReLU()
+        )
+        self.up1 = Block(features * 8, features * 8, down=False, act='relu', use_dropout=False)
+        self.up2 = Block(features * 8 * 2, features * 8, down=False, act='relu', use_dropout=False)
+        self.up3 = Block(features * 8 * 2, features * 8, down=False, act='relu', use_dropout=False)
+        self.up4 = Block(features * 8 * 2, features * 8, down=False, act='relu', use_dropout=False)
+        self.up5 = Block(features * 8 * 2, features * 4, down=False, act='relu', use_dropout=False)
+        self.up6 = Block(features * 4 * 2, features * 2, down=False, act='relu', use_dropout=False)
+        self.up7 = Block(features * 2 * 2, features, down=False, act='relu', use_dropout=False)
 
-        self.final_conv = nn.Conv2d(out_list[-1], num_channels, kernel_size=3, padding=1)
+        self.final_up = nn.Sequential(
+            nn.ConvTranspose2d(features * 2, out_channels, 4, 2, 1),
+            nn.Tanh()
+        )
 
     def forward(self, x):
-        skips = []
-        for i, down_block in enumerate(self.down_blocks):
-            x, skip = down_block(x)
-            skips.append(skip)
-
-        skips = skips[::-1]
-        x = self.middle_part(x)
-
-        for i, up_block in enumerate(self.up_blocks):
-            x = up_block(x, skips[i])
-
-        x = self.final_conv(x)
-
-        return nn.Tanh()(x)
+        d1 = self.initial_down(x)
+        d2 = self.down1(d1)
+        d3 = self.down2(d2)
+        d4 = self.down3(d3)
+        d5 = self.down4(d4)
+        d6 = self.down5(d5)
+        d7 = self.down6(d6)
+        bottleneck = self.bottleneck(d7)
+        up1 = self.up1(bottleneck)
+        up2 = self.up2(torch.cat([up1, d7], 1))
+        up3 = self.up3(torch.cat([up2, d6], 1))
+        up4 = self.up4(torch.cat([up3, d5], 1))
+        up5 = self.up5(torch.cat([up4, d4], 1))
+        up6 = self.up6(torch.cat([up5, d3], 1))
+        up7 = self.up7(torch.cat([up6, d2], 1))
+        return self.final_up(torch.cat([up7, d1], 1))
 
 
 

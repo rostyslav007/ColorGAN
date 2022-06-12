@@ -6,6 +6,8 @@ from Dataset import ColorDataset
 from train_utils import *
 import torchvision
 from utils import *
+from PIL import ImageCms
+from train_utils import get_crit_loss, get_gen_loss
 import os
 from torchvision.utils import make_grid
 from tqdm import tqdm
@@ -14,87 +16,99 @@ import numpy as np
 from Generator import Generator
 from Discriminator import Discriminator
 from config import *
-torch.backends.cudnn.benchmark = True
 
 
 dataset = ColorDataset(dir_name, img_size)
 data_loader = DataLoader(dataset, batch_size, shuffle=True)
 
-generator = Generator(in_list, out_list, img_size).cuda()
-discriminator = Discriminator(in_channels=3).cuda()
+generator = Generator(in_channels=1, out_channels=3, features=16).cuda()
+discriminator = Discriminator(in_channels=4).cuda()
 
 #x = torch.randn((2, 1, *img_size)).cuda()
-
-#print(generator(x).shape)
-
+#for x, y in data_loader:
+#    grid = make_grid(y*0.5 + 0.5)
+#    img = torchvision.transforms.ToPILImage()(grid)
+#    img.show()
 #exit()
-generator_loss = GeneratorLoss()
-discriminator_loss = DiscriminatorLoss()
 gen_optim = torch.optim.Adam(generator.parameters(), lr=0.0002, betas=(0.5, 0.999))
 disc_optim = torch.optim.Adam(discriminator.parameters(), lr=0.0002, betas=(0.5, 0.999))
 
+bce = nn.BCEWithLogitsLoss()
+L1 = nn.L1Loss()
+
 disc_loss_list = []
 gen_loss_list = []
-scaler = torch.cuda.amp.GradScaler()
+d_scaler = torch.cuda.amp.GradScaler()
+g_scaler = torch.cuda.amp.GradScaler()
+
+#for x, y in data_loader:
+#    pil_img = torchvision.transforms.ToPILImage()(y[0].clamp(-1, 1)*0.5 + 0.5)
+#    grey = torchvision.transforms.ToPILImage()(x[0].clamp(-1, 1)*0.5 + 0.5)
+#    plt.imshow(pil_img, cmap='gray')
+#    plt.show()
+#    plt.imshow(grey, cmap='gray')
+#    plt.show()
+#    break
+#exit()
+
 
 for e in range(num_epochs):
-    for i, data in tqdm(enumerate(data_loader)):
-        real_images = data['lab'].cuda()
+    for i, (x, y) in tqdm(enumerate(data_loader)):
+        x, y = x.cuda(), y.cuda()
+        fake_img = generator(x)
 
         with torch.cuda.amp.autocast():
-            l_channel = real_images[:, 0:1, :, :]
-            ab_channels = real_images[:, 1:, :, :]
-            fake_ab = generator(l_channel)
+            print(x.shape, fake_img.shape)
+            disc_preds_fake = discriminator(x, fake_img.detach())
+            disc_preds_real = discriminator(x, y)
 
-            disc_preds_fake = discriminator(l_channel, fake_ab.detach())
-            disc_preds_real = discriminator(l_channel, ab_channels)
-
-            disc_fake_loss = discriminator_loss(disc_preds_fake, torch.zeros_like(disc_preds_fake))
-            disc_real_loss = discriminator_loss(disc_preds_real, torch.ones_like(disc_preds_real))
-            disc_loss = (disc_real_loss + disc_fake_loss) / 2
+            disc_fake_loss = bce(disc_preds_fake, torch.zeros_like(disc_preds_fake))
+            disc_real_loss = bce(disc_preds_real, torch.ones_like(disc_preds_real))
+            disc_loss = disc_real_loss + disc_fake_loss
 
         disc_optim.zero_grad()
-        scaler.scale(disc_loss).backward()
-        scaler.step(disc_optim)
-        scaler.update()
+        d_scaler.scale(disc_loss).backward()
+        d_scaler.step(disc_optim)
+        d_scaler.update()
 
         disc_loss_list.append(disc_loss.item())
 
-        #learn Generator
+        #learn generator
         with torch.cuda.amp.autocast():
-            generated_ab = generator(l_channel)
-            disc_preds = discriminator(l_channel, generated_ab.detach())
-            gen_loss = generator_loss(torch.ones_like(disc_preds), disc_preds, generated_ab, ab_channels)
+            disc_preds = discriminator(x, fake_img.detach())
+            gen_loss = -bce(disc_preds, torch.zeros_like(disc_preds)) + 100*L1(fake_img, y)
 
         gen_optim.zero_grad()
-        scaler.scale(gen_loss).backward()
-        scaler.step(gen_optim)
-        scaler.update()
+        g_scaler.scale(gen_loss).backward()
+        g_scaler.step(gen_optim)
+        g_scaler.update()
 
         gen_loss_list.append(gen_loss.item())
 
         print('\ndisc loss: ', disc_loss_list[-1], ' gen loss: ', gen_loss_list[-1])
+        if e % 20 == 0 and i == 0:
+            imgs = fake_img
+            print(torch.abs(fake_img - y).max())
+            grid = make_grid((imgs * 0.5 + 0.5).cpu().detach())
+            img = torchvision.transforms.ToPILImage()(grid)
+            img.show()
 
-    if e % 10 == 0:
+    if e % 50 == 0:
+        disc_optim = torch.optim.Adam(discriminator.parameters(), lr=0.0002 - (e // 50) * 0.00001, betas=(0.5, 0.999))
         gen_path = os.path.join('models', 'generator', 'generator_epoch_' + str(e) + '.pt')
         disc_path = os.path.join('models', 'discriminator', 'discriminator_epoch_' + str(e) + '.pt')
         torch.save(generator.state_dict(), gen_path)
         torch.save(discriminator.state_dict(), disc_path)
 
-generator = Generator(in_list, out_list, img_size)
-generator.load_state_dict(torch.load('models/generator/generator_epoch_10.pt'))
 
-for data in data_loader:
-    gan_batch = data['lab']
-    lab_c = gan_batch[:, 0:1, :, :]
-    ab_channels = generator(lab_c)
-    img_tensor = torch.cat([lab_c, ab_channels], dim=1)
-    print(img_tensor.shape)
-    grid = make_grid(img_tensor, normalize=True)
+generator = Generator(in_channels=1, out_channels=3)
+generator.load_state_dict(torch.load('models/generator/generator_epoch_20.pt'))
+
+for x, y in data_loader:
+    imgs = generator(x)*0.5 + 0.5
+    grid = make_grid(imgs.cpu().detach())
     img = torchvision.transforms.ToPILImage()(grid)
-    plt.imshow(img)
-    plt.show()
-    lab_tensor2cv_rgb(img_tensor[0], 'test.png')
+    img.show()
     break
 
 
